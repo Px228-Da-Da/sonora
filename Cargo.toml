@@ -1,0 +1,18 @@
+[package]
+name = "sonora"
+version = "0.1.0"
+edition = "2024"
+description = "Real-time audio metering for the desktop — spectrogram, spectrum analyzer, LUFS/peak loudness and a stereo goniometer. Captures system audio (WASAPI loopback) or any input device."
+license = "MIT"
+repository = "https://github.com/Px228-Da-Da/sonora"
+keywords = ["audio", "metering", "lufs", "spectrogram", "dsp"]
+categories = ["multimedia::audio", "visualization"]
+
+[dependencies]
+cpal = "0.18.1"
+eframe = "0.35.0"
+rustfft = "6.4.1"
+
+[profile.release]
+opt-level = 3
+lto = true
