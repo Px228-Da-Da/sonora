@@ -23,15 +23,44 @@ impl SharedAudio {
     pub fn drain(&mut self) -> Vec<[f32; 2]> {
         std::mem::take(&mut self.frames)
     }
+
+    /// Append captured frames, dropping the oldest if the UI has stalled.
+    pub fn push(&mut self, frames: &[[f32; 2]]) {
+        self.frames.extend_from_slice(frames);
+        let len = self.frames.len();
+        if len > MAX_BUFFERED_FRAMES {
+            self.frames.drain(0..len - MAX_BUFFERED_FRAMES);
+        }
+    }
+}
+
+/// What is actually producing frames. cpal covers devices; per-application capture
+/// needs WASAPI process loopback, which cpal does not expose.
+/// Held purely to keep the capture alive: dropping either variant stops it.
+#[allow(dead_code)]
+enum Backend {
+    Device(cpal::Stream),
+    #[cfg(windows)]
+    App(crate::proc_audio::ProcessCapture),
 }
 
 pub struct AudioCapture {
-    _stream: cpal::Stream,
+    _backend: Backend,
     pub shared: Arc<Mutex<SharedAudio>>,
+    /// Last error reported by the stream callback, for the UI to pick up. The
+    /// callback can't print: release builds run without a console.
+    stream_error: Arc<Mutex<Option<String>>>,
     pub sample_rate: u32,
     pub channels: u16,
     #[allow(dead_code)]
     pub device_name: String,
+}
+
+impl AudioCapture {
+    /// Take the pending stream error, if the device faulted since the last call.
+    pub fn take_error(&self) -> Option<String> {
+        self.stream_error.lock().ok().and_then(|mut slot| slot.take())
+    }
 }
 
 /// How a device is captured.
@@ -107,20 +136,23 @@ pub fn start_capture(device: &cpal::Device, kind: SourceKind) -> Result<AudioCap
     let config: cpal::StreamConfig = supported.into();
 
     let shared = Arc::new(Mutex::new(SharedAudio::default()));
+    let errors: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
+    let (s, e) = (shared.clone(), errors.clone());
     let stream = match sample_format {
-        SampleFormat::F32 => build_stream::<f32>(device, &config, channels, shared.clone()),
-        SampleFormat::I16 => build_stream::<i16>(device, &config, channels, shared.clone()),
-        SampleFormat::U16 => build_stream::<u16>(device, &config, channels, shared.clone()),
-        SampleFormat::I32 => build_stream::<i32>(device, &config, channels, shared.clone()),
+        SampleFormat::F32 => build_stream::<f32>(device, &config, channels, s, e),
+        SampleFormat::I16 => build_stream::<i16>(device, &config, channels, s, e),
+        SampleFormat::U16 => build_stream::<u16>(device, &config, channels, s, e),
+        SampleFormat::I32 => build_stream::<i32>(device, &config, channels, s, e),
         other => Err(format!("unsupported sample format: {other:?}")),
     }?;
 
     stream.play().map_err(|e| format!("stream.play failed: {e}"))?;
 
     Ok(AudioCapture {
-        _stream: stream,
+        _backend: Backend::Device(stream),
         shared,
+        stream_error: errors,
         sample_rate,
         channels,
         device_name: dev_name,
@@ -132,13 +164,18 @@ fn build_stream<T>(
     config: &cpal::StreamConfig,
     channels: u16,
     shared: Arc<Mutex<SharedAudio>>,
+    errors: Arc<Mutex<Option<String>>>,
 ) -> Result<cpal::Stream, String>
 where
     T: SizedSample,
     f32: FromSample<T>,
 {
     let ch = channels as usize;
-    let err_fn = |e| eprintln!("audio stream error: {e}");
+    let err_fn = move |e: cpal::Error| {
+        if let Ok(mut slot) = errors.lock() {
+            *slot = Some(e.to_string());
+        }
+    };
 
     let data_fn = move |data: &[T], _: &cpal::InputCallbackInfo| {
         if ch == 0 {
@@ -162,4 +199,22 @@ where
     device
         .build_input_stream(config.clone(), data_fn, err_fn, None)
         .map_err(|e| format!("build_input_stream failed: {e}"))
+}
+
+/// Capture one application instead of a device: everything `pid` and its children
+/// play, and nothing else.
+#[cfg(windows)]
+pub fn start_app_capture(pid: u32, name: &str) -> Result<AudioCapture, String> {
+    let shared = Arc::new(Mutex::new(SharedAudio::default()));
+    let errors: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let (capture, sample_rate, channels) =
+        crate::proc_audio::start(pid, shared.clone(), errors.clone())?;
+    Ok(AudioCapture {
+        _backend: Backend::App(capture),
+        shared,
+        stream_error: errors,
+        sample_rate,
+        channels,
+        device_name: name.to_string(),
+    })
 }
